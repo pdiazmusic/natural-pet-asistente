@@ -15,6 +15,7 @@ Variables de entorno requeridas (se configuran como GitHub Secrets):
 """
 import os
 import json
+import time
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
@@ -84,13 +85,32 @@ def get_notion_tasks():
     return tasks
 
 
+def retry_on_transient_error(fn, attempts=4, base_delay=5):
+    """Reintenta fn() si Google devuelve un error temporal (5xx / servicio no disponible).
+    No reintenta errores permanentes (permisos, Sheet no encontrado, etc.) — esos se
+    reportan de inmediato porque reintentar no los va a resolver."""
+    last_err = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except gspread.exceptions.APIError as e:
+            status = getattr(e.response, "status_code", None)
+            if status and 500 <= status < 600 and i < attempts - 1:
+                wait = base_delay * (2 ** i)
+                print(f"Error temporal de Google ({status}), reintentando en {wait}s... (intento {i+1}/{attempts})")
+                time.sleep(wait)
+                last_err = e
+                continue
+            raise
+    raise last_err
+
 def main():
     creds_dict = json.loads(GCP_JSON, strict=False)
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     gc = gspread.authorize(creds)
 
-    sh = gc.open(SHEET_NAME)
+    sh = retry_on_transient_error(lambda: gc.open(SHEET_NAME))
     ws = sh.worksheet("Tareas")
 
     tasks = get_notion_tasks()
